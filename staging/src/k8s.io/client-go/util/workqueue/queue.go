@@ -130,10 +130,11 @@ func (q *Type) Add(item interface{}) {
 	q.metrics.add(item)
 
 	q.dirty.insert(item)
-	if q.processing.has(item) {
+	if q.processing.has(item) { // 如果正在被处理，则返回
 		return
 	}
 
+	// 如果没有被处理，则加到q.queue中
 	q.queue = append(q.queue, item)
 	q.cond.Signal()
 }
@@ -153,14 +154,17 @@ func (q *Type) Len() int {
 func (q *Type) Get() (item interface{}, shutdown bool) {
 	q.cond.L.Lock()
 	defer q.cond.L.Unlock()
+	// 这里分为两种情况，如果队列为空且队列不处于关闭状态，则等待下一个元素到来
 	for len(q.queue) == 0 && !q.shuttingDown {
 		q.cond.Wait()
 	}
+	// 跟LINE263配合，当worker get从wait阻塞被唤醒时，如果此时队列仍然为空，说明不是Add方法唤醒getter的，而是shutdown方法broadcast唤醒了所有的worker，因此关闭直接退出worker
 	if len(q.queue) == 0 {
 		// We must be shutting down.
 		return nil, true
 	}
 
+	// 如果队列不为空，获取q.queue第一个元素
 	item = q.queue[0]
 	// The underlying array still exists and reference this object, so the object will not be garbage collected.
 	q.queue[0] = nil
@@ -177,6 +181,7 @@ func (q *Type) Get() (item interface{}, shutdown bool) {
 // Done marks item as done processing, and if it has been marked as dirty again
 // while it was being processed, it will be re-added to the queue for
 // re-processing.
+// Done方法的作用是标记一个元素已经被处理完成
 func (q *Type) Done(item interface{}) {
 	q.cond.L.Lock()
 	defer q.cond.L.Unlock()
@@ -184,11 +189,11 @@ func (q *Type) Done(item interface{}) {
 	q.metrics.done(item)
 
 	q.processing.delete(item)
-	if q.dirty.has(item) {
+	if q.dirty.has(item) { // 对应Add方法(如果元素在processing中则加到dirty集合、但不加入到queue)，当processing处理完成，重新加入到queue集合
 		q.queue = append(q.queue, item)
-		q.cond.Signal()
-	} else if q.processing.len() == 0 {
-		q.cond.Signal()
+		q.cond.Signal() // 通知getter有新的元素
+	} else if q.processing.len() == 0 { // 增加drain work queue on shutting down特性时加上的，https://github.com/kubernetes/kubernetes/pull/101928
+		q.cond.Signal() // 因为在ShutDownWithDrain的waitForProcessing函数中，当仍然有正在处理的元素，会wait等待，因此在worker消费完一个元素，判断processing是否为空，如果为空则唤醒ShutDownWithDrain协程
 	}
 }
 
@@ -255,7 +260,7 @@ func (q *Type) shutdown() {
 	q.cond.L.Lock()
 	defer q.cond.L.Unlock()
 	q.shuttingDown = true
-	q.cond.Broadcast()
+	q.cond.Broadcast() // 设置为shutdown时唤醒所有的getter
 }
 
 func (q *Type) ShuttingDown() bool {
